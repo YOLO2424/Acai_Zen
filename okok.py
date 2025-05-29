@@ -1,8 +1,6 @@
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
 import os
 
 # -----------------------------
@@ -77,8 +75,8 @@ class Food:
         if self.masa is None:
             if self.vol:
                 self.masa = self.dens * self.vol * 0.001 # Asumiendo vol en litros para obtener masa en kg
-            else: # Si no hay vol, asumimos masa unitaria (ej. 1 kg), podría necesitar ajuste
-                self.masa = 1.0
+            else: # Si ni masa ni volumen fueron provistos
+                raise ValueError(f"El producto '{self.nombre}' (ID: {self.id}) debe tener 'vol_std' o 'masa_std' definido.")
 
 
 @dataclass
@@ -97,15 +95,6 @@ class Transporte:
     vel_kmh: float
 
 # -----------------------------
-# Nivel 1.c: Calibration híbrido
-# -----------------------------
-@dataclass
-class Calibration:
-    def correct(self, food_id:int, pack_id:int, trans_id:int, dist_km:float, temp_phys:float) -> float:
-        # Comparar con datos reales (placeholder)
-        return 0.0
-
-# -----------------------------
 # Nivel 1.b: Simulador físico
 # -----------------------------
 @dataclass
@@ -117,7 +106,7 @@ class DeliverySim:
     dist_km: float
     k: float = field(init=False)
     temp_final: float = field(init=False)
-    temp_corrected: float = field(init=False)
+    # temp_corrected: float = field(init=False) # No longer used
 
     def __post_init__(self):
         A = self.pack.area()
@@ -135,8 +124,8 @@ class DeliverySim:
         else:
             self.temp_final = TEMP_AMBIENTE + (self.food.temp_inicial - TEMP_AMBIENTE) * np.exp(-self.k * t)
         
-        corr = Calibration().correct(self.food.id, None, None, self.dist_km, self.temp_final)
-        self.temp_corrected = self.temp_final + corr
+        # corr = 0.0 # Calibration class removed, corr is 0.0 - No longer needed
+        # self.temp_corrected = self.temp_final + corr # No longer used, temp_final is used directly
 
     def summary_terminal(self):
         print("\n--- Resumen de entrega ---")
@@ -146,7 +135,7 @@ class DeliverySim:
         print(f"Tiempo (min)         : {self.tiempo_min:.1f}")
         print(f"Temp inicial         : {self.food.temp_inicial:.1f}°C")
         print(f"Temp final física   : {self.temp_final:.1f}°C")
-        print(f"Temp final corregida : {self.temp_corrected:.1f}°C")
+        # print(f"Temp final corregida : {self.temp_corrected:.1f}°C") # Replaced by temp_final
 
     def generate_image(self, path='resumen.png'):
         img = Image.new('RGB', (450, 250), 'white')
@@ -174,7 +163,7 @@ class DeliverySim:
             f"Tiempo (min)         : {self.tiempo_min:.1f}",
             f"Temp inicial         : {self.food.temp_inicial:.1f}°C",
             f"Temp final física   : {self.temp_final:.1f}°C",
-            f"Temp final corregida : {self.temp_corrected:.1f}°C",
+            # f"Temp final corregida : {self.temp_corrected:.1f}°C", # Replaced by temp_final
         ]
         y = 20
         for line in lines:
@@ -228,27 +217,88 @@ class DeliverySim:
             plt.show()
 
     def time_to_temp(self, target_temp: float) -> float:
-        if self.k <= 1e-9 or np.isinf(self.k) or np.isnan(self.k):
-             return float('inf') 
+        # Tolerance for floating point comparisons
+        tol = 1e-6
 
-        temp_diff_ratio_arg = (target_temp - TEMP_AMBIENTE) / (self.food.temp_inicial - TEMP_AMBIENTE + 1e-9)
-
-        if temp_diff_ratio_arg <= 0: 
-            if abs(target_temp - TEMP_AMBIENTE) < 1e-6 : 
-                if abs(self.food.temp_inicial - TEMP_AMBIENTE) < 1e-6: return 0.0 
-                else: return float('inf') 
+        # 1. Handle problematic k (near zero, inf, or NaN)
+        # If k is very small, time to change temperature is effectively infinite.
+        if self.k < tol or np.isinf(self.k) or np.isnan(self.k): # Changed self.k <= 1e-9 to self.k < tol
             return float('inf')
 
-        if ('caliente' in self.food.categoria and target_temp >= self.food.temp_inicial) or \
-           ('fria' in self.food.categoria and target_temp <= self.food.temp_inicial) :
+        # 2. If target temperature is (almost) the same as the initial temperature
+        if abs(self.food.temp_inicial - target_temp) < tol:
             return 0.0
-        
-        try:
-            t_sec = -np.log(temp_diff_ratio_arg) / self.k
-        except (ValueError,RuntimeWarning):
+
+        # Calculate differences from ambient temperature
+        delta_inicial_ambiente = self.food.temp_inicial - TEMP_AMBIENTE
+        delta_target_ambiente = target_temp - TEMP_AMBIENTE
+
+        # 3. If initial temperature is (almost) the same as ambient
+        if abs(delta_inicial_ambiente) < tol:
+            # If T_inicial is ambient, it can only reach a target_temp that is also ambient (time 0, caught by check 2).
+            # Any other target_temp is unreachable.
+            return float('inf')
+
+        # 4. Core conditions for reachability:
+        #   a) Target cannot be on the "other side" of ambient temperature.
+        #      (e.g., cooling from hot to ambient, target cannot be colder than ambient)
+        #      This is true if the signs of the deltas are different.
+        if delta_inicial_ambiente * delta_target_ambiente < -tol: # Check for significantly different signs
+            return float('inf')
+
+        #   b) Target cannot be "further" from ambient than the initial temperature was (on the same side).
+        #      (e.g., cooling from 80C to 25C ambient, target cannot be 90C)
+        #      This means abs(delta_target_ambiente) > abs(delta_inicial_ambiente).
+        #      The equality case (abs(delta_target_ambiente) == abs(delta_inicial_ambiente))
+        #      implies target_temp == food.temp_inicial (if on same side) or
+        #      target_temp is T_amb - (T_ini - T_amb) (if on opposite side, caught by 4a).
+        #      If target_temp == food.temp_inicial, it's caught by check #2.
+        if abs(delta_target_ambiente) > abs(delta_inicial_ambiente) + tol : # Added tol for stricter "further"
+            return float('inf')
+
+        #   c) If target temperature is ambient temperature (and initial was not).
+        #      Newton's Law implies it takes infinite time to *exactly* reach ambient.
+        if abs(delta_target_ambiente) < tol:
             return float('inf')
             
-        return t_sec / 60.0
+        # 5. Calculate the ratio for the logarithm.
+        #    temp_diff_ratio_arg = (target_temp - TEMP_AMBIENTE) / (self.food.temp_inicial - TEMP_AMBIENTE)
+        #    This is delta_target_ambiente / delta_inicial_ambiente.
+        #    At this point:
+        #    - delta_inicial_ambiente is not zero.
+        #    - delta_target_ambiente is not zero.
+        #    - They have the same sign (or one is numerically zero, handled by 'c').
+        #    - abs(delta_target_ambiente) <= abs(delta_inicial_ambiente).
+        #    So, the ratio should be in (0, 1].
+        temp_diff_ratio_arg = delta_target_ambiente / delta_inicial_ambiente
+
+        # If ratio is 1 (or very close, meaning target is very close to initial), time is 0 (caught by check 2).
+        # If ratio is <= 0 (e.g. due to floating point issues after previous checks), it's invalid for log.
+        # It should be positive and less than 1 for a valid positive time.
+        if temp_diff_ratio_arg <= tol or temp_diff_ratio_arg > 1.0 - tol: # Ratio should be (tol, 1-tol)
+            # if ratio is very close to 1, it means T_target is very close to T_initial, time is effectively 0 (covered by check 2)
+            # if it's outside this range, it implies an issue or an edge case that should lead to inf or 0 time
+            # For example, if temp_diff_ratio_arg is 1, log(1)=0, time = 0.
+            # If temp_diff_ratio_arg is slightly greater than 1 due to float precision (e.g. 1.000000001)
+            # -log(1+eps)/k would be small negative, this should be treated as 0 or inf depending on context.
+            # Given check 2, if ratio is near 1, it means target ~ initial, so time is 0.
+            # If it's <= tol, it's problematic (e.g. target is ambient or crossed ambient)
+            if abs(temp_diff_ratio_arg - 1.0) < tol : # Effectively target is initial
+                 return 0.0
+            return float('inf')
+
+
+        try:
+            t_sec = -np.log(temp_diff_ratio_arg) / self.k
+        except (ValueError, RuntimeWarning):
+            # This catch is a safeguard, previous checks should prevent invalid args to log.
+            return float('inf')
+
+        # Time must be non-negative. A negative t_sec would mean temp_diff_ratio_arg > 1.
+        if t_sec < 0: # Check for negative time, which is unphysical
+            return float('inf') # Or 0.0 if t_sec is extremely close to 0
+
+        return t_sec / 60.0 # Convert seconds to minutes
 
     def critical_time(self) -> float:
         crit_t = 60.0 if 'caliente' in self.food.categoria else 10.0
@@ -259,7 +309,8 @@ class DeliverySim:
         
         crit_temp = 60.0 if 'caliente' in self.food.categoria else 10.0
         initial_temp = self.food.temp_inicial
-        corrected_temp = self.temp_corrected
+        # corrected_temp = self.temp_corrected # No longer used, use self.temp_final
+        current_temp_final = self.temp_final # Use self.temp_final instead of corrected_temp
         score_temp_0_1 = 0.0
 
         if 'caliente' in self.food.categoria:
@@ -267,17 +318,17 @@ class DeliverySim:
                 score_temp_0_1 = 0.0
             else: 
                 if (initial_temp - crit_temp) == 0: 
-                    score_temp_0_1 = 0.0 if corrected_temp < initial_temp else 1.0
+                    score_temp_0_1 = 0.0 if current_temp_final < initial_temp else 1.0 # Use current_temp_final
                 else:
-                    score_temp_0_1 = (corrected_temp - crit_temp) / (initial_temp - crit_temp)
+                    score_temp_0_1 = (current_temp_final - crit_temp) / (initial_temp - crit_temp) # Use current_temp_final
         else: 
             if initial_temp >= crit_temp: 
                 score_temp_0_1 = 0.0
             else: 
                 if (crit_temp - initial_temp) == 0: 
-                     score_temp_0_1 = 0.0 if corrected_temp > initial_temp else 1.0
+                     score_temp_0_1 = 0.0 if current_temp_final > initial_temp else 1.0 # Use current_temp_final
                 else:
-                    score_temp_0_1 = (crit_temp - corrected_temp) / (crit_temp - initial_temp)
+                    score_temp_0_1 = (crit_temp - current_temp_final) / (crit_temp - initial_temp) # Use current_temp_final
         
         score_temp_0_1 = max(0.0, min(score_temp_0_1, 1.0))
 
